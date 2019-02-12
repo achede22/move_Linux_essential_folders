@@ -1,0 +1,159 @@
+#!/bin/bash
+
+
+##Assumed
+#xvdf1 new 120gb root
+#xvdg1 filesystem from dump from.
+
+OS_STRUCTURE=$1 ##Get OS Structure
+## Partition, clone UEFI, LVM Creation, Mount Volumes, Data Move, Change Root.
+
+dumptonewfs(){
+# Folder creation
+mkdir /media/oldroot /media/root
+# Temporary Directories for data migration
+mkdir -p /media/root /media/var /media/var_log /media/var_log_audit /media/var_tmp /media/tmp /media/home 
+
+# Clone of UEFI Volume
+  
+ if [[ "$OS_STRUCTURE" == "CENTOS" ]]; then
+  ##Used device is xvda as by defualt if have more than 1 device available with same uuid the one in use is the last one. As consecuence, xvda is not in useand is  a cold device. 
+  dd if=/dev/xvdg of=/dev/xvdf bs=1M conv=noerror,sync status=progress
+  ##Start Copy
+  mount -o rw,nouuid /dev/xvdg1 /media/oldroot
+  mount -o rw,nouuid /dev/xvdf1 /media/root
+  xfsdump -J - /media/oldroot | xfsrestore -J - /media/root
+  sync
+  umount /media/root /media/oldroot
+
+  ## Extend and create partitions on partition table
+  echo "RESIZE: Creating partitions"
+  ## Delete current partition
+  echo -e "d\nw" | fdisk /dev/xvdf >/dev/null 2>&1
+  ## Create new partition with size 30GB(Sectors)
+  echo -e "nn\np\n1\n\n62914560\nw" | fdisk /dev/xvdf >/dev/null 2>&1
+  ## Create secondary partition with size 90
+  echo -e "nn\np\n2\n\n\nw" | fdisk /dev/xvdf >/dev/null 2>&1
+  ## Set secondary partition with max size
+  echo -e "t\n2\n83\nw" | fdisk /dev/xvdf >/dev/null 2>&1
+  ## Creating VG/LVM/PV
+  echo "RESIZE: Create LVM Volumes"
+  ## Create volumegroups/physical volumes
+  pvcreate /dev/xvdf2 >/dev/null 2>&1
+  vgcreate vgroot /dev/xvdf2 >/dev/null 2>&1
+elif [[ "OS_STRUCTURE" == "REDHAT" ]]; then
+
+  # Partitioning of the seccond disk
+  parted /dev/xvdf mkpart primary 2048s 4095s
+  dd if=/dev/xvda1 of=/dev/xvdf1 bs=1M conv=noerror,sync status=progress
+  parted /dev/xvdf --script -- mkpart primary 4096s 25% 
+  parted /dev/xvdf --script -- mkpart primary 25% 100%
+  # Creation of Physical and Groups Volumes
+  pvcreate /dev/xvdf3
+  vgcreate vgroot /dev/xvdf3
+  # Physical Volume Formating, Check and Mount
+  mkfs.xfs -f /dev/xvdf2
+  xfs_repair /dev/xvdf2 
+  mount -o rw,nouuid /dev/xvdf2 /media/root 
+else
+echo "Invalid $OS_STRUCTURE OS"
+exit 1
+fi
+
+# Creation of Logical Volumes
+lvcreate -L 20G -n var vgroot 
+ lvcreate -L 5G -n var_tmp vgroot 
+ lvcreate -L 20G -n var_log vgroot 
+ lvcreate -L 5G -n var_log_audit vgroot 
+ lvcreate -L 20G -n tmp vgroot 
+ lvcreate -l 100%FREE -n home vgroot
+
+# Logical Volumes Formating
+mkfs.xfs -f /dev/vgroot/var 
+ mkfs.xfs -f /dev/vgroot/var_log
+mkfs.xfs -f /dev/vgroot/var_log_audit
+mkfs.xfs -f /dev/vgroot/var_tmp
+mkfs.xfs -f /dev/vgroot/tmp
+mkfs.xfs -f /dev/vgroot/home 
+
+# Data Origin Mount
+mount -o rw,nouuid /dev/xvda2 /media/oldroot
+
+# Data Migration and Syncronization
+xfsdump -J - /media/oldroot | xfsrestore -J - /media/root
+sync
+
+# Final Destination Data Folders
+mount /dev/vgroot/var /media/var
+mount /dev/vgroot/var_log /media/var_log
+mount /dev/vgroot/home /media/home
+
+echo "RESIZE: Copying remaining data"
+
+# Copy /var
+cp -rpZ /media/root/var/* /media/var/
+rm -rf /media/var/log/* /media/var/tmp/* 
+ mkdir -p /media/var/log /media/var/tmp /media/var/log/audit 
+ # Copy /home
+cp -rpZ /media/root/home/* /media/home
+rm -rf /media/root/home/* 
+ # Copy /var/log
+cp -rpZ /media/root/var/log/* /media/var_log/
+rm -rf /media/var_log/audit/* 
+ # Re-Increase size for Root
+xfs_growfs /media/root 
+ # Clean incorrect
+rm -rf /media/root/var/* /media/root/home/* /media/root/tmp/*
+mkdir -p /media/root/var/log/audit /media/root/var/tmp
+# Doing remount on proper filesystem structure
+umount /media/var_log 
+ umount /media/var 
+ umount /media/home 
+ mount /dev/vgroot/home /media/root/home
+mount /dev/vgroot/var /media/root/var
+mount /dev/vgroot/var_log /media/root/var/log
+# Change Root Path
+chroot /media/root restorecon -R /home
+chroot /media/root restorecon -R /var
+chroot /media/root restorecon -R /var/log
+chroot /media/root restorecon -R /var/tmp
+chroot /media/root restorecon -R /tmp
+
+#chroot /media/root restorecon -v /home
+#chroot /media/root restorecon -v /var
+#chroot /media/root restorecon -v /var/log
+#chroot /media/root restorecon -v /var/tmp
+#chroot /media/root restorecon -v /tmp
+}
+
+
+## Set FSTAB Format
+
+set_fstab(){
+
+blkid=$(blkid /dev/xvda2)
+VOLUUID=$(echo $blkid | awk -F'"' '{print $2}') 
+
+##To be added
+
+echo "
+####################################
+##   BEGIN DEFAULT VOLUMEGROUPS   ##  
+####################################
+UUID=$VOLUUID /                       xfs     defaults        0 0
+/dev/mapper/vgroot-var /var xfs defaults 0 0
+/dev/mapper/vgroot-var_tmp /var/tmp xfs defaults,nodev,nosuid 0 0
+/dev/mapper/vgroot-var_log /var/log xfs defaults 0 0
+/dev/mapper/vgroot-var_log_audit /var/log/audit xfs defaults 0 0
+/dev/mapper/vgroot-home /home xfs defaults,nodev 0 0
+/dev/mapper/vgroot-tmp /tmp xfs defaults,nofail,nodev 0 0
+none      /dev/shm        tmpfs   defaults,nosuid,nodev,noexec,size=1G        0 0
+#####################################
+##    END DEFAULT VOLUMEGROUPS     ##
+#####################################" > /media/root/etc/fstab
+}
+
+
+## BEGIN ##
+dumptonewfs
+set_fstab
